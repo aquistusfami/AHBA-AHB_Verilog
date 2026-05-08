@@ -1,7 +1,7 @@
 `timescale 1ns / 1ps
 
 // ============================================================
-// AHB-Lite Interconnect Multiplexer
+// FULL AHB (AMBA 2) Interconnect Multiplexer
 // ============================================================
 
 module ahb_mux #(
@@ -15,6 +15,7 @@ module ahb_mux #(
     // ========================================================
 
     input  wire [$clog2(NUM_MASTERS)-1:0] HMASTER,
+    input  wire                           HMASTLOCK, // FIX 2: Thêm HMASTLOCK input
 
     input  wire        HSEL_S0,
     input  wire        HSEL_S1,
@@ -77,6 +78,7 @@ module ahb_mux #(
     input  wire [31:0] HRDATA_S0,
     input  wire        HREADYOUT_S0,
     input  wire [1:0]  HRESP_S0,
+    input  wire [15:0] HSPLIT_S0,
 
     // ========================================================
     // SLAVE 1
@@ -85,6 +87,7 @@ module ahb_mux #(
     input  wire [31:0] HRDATA_S1,
     input  wire        HREADYOUT_S1,
     input  wire [1:0]  HRESP_S1,
+    input  wire [15:0] HSPLIT_S1,
 
     // ========================================================
     // SLAVE 2
@@ -93,6 +96,7 @@ module ahb_mux #(
     input  wire [31:0] HRDATA_S2,
     input  wire        HREADYOUT_S2,
     input  wire [1:0]  HRESP_S2,
+    input  wire [15:0] HSPLIT_S2,
 
     // ========================================================
     // SLAVE 3
@@ -101,6 +105,7 @@ module ahb_mux #(
     input  wire [31:0] HRDATA_S3,
     input  wire        HREADYOUT_S3,
     input  wire [1:0]  HRESP_S3,
+    input  wire [15:0] HSPLIT_S3,
 
     // ========================================================
     // DEFAULT SLAVE
@@ -109,11 +114,15 @@ module ahb_mux #(
     input  wire [31:0] HRDATA_DEF,
     input  wire        HREADYOUT_DEF,
     input  wire [1:0]  HRESP_DEF,
+    input  wire [15:0] HSPLIT_DEF,
 
     // ========================================================
     // BROADCAST TO SLAVES
     // ========================================================
 
+    output wire [$clog2(NUM_MASTERS)-1:0] HMASTER_OUT,
+    output wire                           HMASTLOCK_OUT, // FIX 2: Phát sóng HMASTLOCK
+    
     output wire [31:0] HADDR,
     output wire [31:0] HWDATA,
     output wire [1:0]  HTRANS,
@@ -123,19 +132,23 @@ module ahb_mux #(
     output wire [3:0]  HPROT,
 
     // ========================================================
-    // RETURN TO MASTERS
+    // RETURN TO MASTERS / ARBITER
     // ========================================================
 
     output wire [31:0] HRDATA,
     output wire        HREADY,
-    output wire [1:0]  HRESP
+    output wire [1:0]  HRESP,
+    output wire [15:0] HSPLIT
 );
 
 //////////////////////////////////////////////////////////////
 // LOCAL PARAMETERS
 //////////////////////////////////////////////////////////////
 
-localparam TR_IDLE    = 2'b00;
+localparam TR_IDLE   = 2'b00;
+localparam TR_BUSY   = 2'b01;
+localparam TR_NONSEQ = 2'b10;
+localparam TR_SEQ    = 2'b11;
 
 localparam RESP_OKAY  = 2'b00;
 localparam RESP_ERROR = 2'b01;
@@ -147,12 +160,14 @@ localparam MASTER_W = $clog2(NUM_MASTERS);
 //////////////////////////////////////////////////////////////
 
 wire hready_global;
+wire [1:0] htrans_int; // Dùng để trích xuất HTRANS cho pipeline
 
 //////////////////////////////////////////////////////////////
 // DATA PHASE PIPELINE REGISTERS
 //////////////////////////////////////////////////////////////
 
 reg [MASTER_W-1:0] HMASTER_data;
+reg [1:0]          HTRANS_data; // FIX 5: Theo dõi loại giao dịch ở Data Phase
 
 reg HSEL_S0_data;
 reg HSEL_S1_data;
@@ -164,15 +179,12 @@ reg HSEL_DEFAULT_data;
 // ADDRESS -> DATA PHASE PIPELINE
 //////////////////////////////////////////////////////////////
 
-// HMASTER may change during wait states.
-// Safe because pipeline registers only update when
-// the current data phase completes (HREADY = 1).
-
 always @(posedge HCLK or negedge HRESETn) begin
 
     if (!HRESETn) begin
 
         HMASTER_data      <= {MASTER_W{1'b0}};
+        HTRANS_data       <= TR_IDLE;
 
         HSEL_S0_data      <= 1'b0;
         HSEL_S1_data      <= 1'b0;
@@ -184,6 +196,7 @@ always @(posedge HCLK or negedge HRESETn) begin
     else if (hready_global) begin
 
         HMASTER_data      <= HMASTER;
+        HTRANS_data       <= htrans_int; // Chốt HTRANS của Pha Địa Chỉ sang Pha Dữ Liệu
 
         HSEL_S0_data      <= HSEL_S0;
         HSEL_S1_data      <= HSEL_S1;
@@ -198,6 +211,11 @@ end
 // MASTER -> SLAVE ADDRESS / CONTROL MUX
 //////////////////////////////////////////////////////////////
 
+// FIX 1: HMASTER_OUT phải lấy từ Data Phase để Slave báo SPLIT cho đúng Master
+assign HMASTER_OUT = HMASTER;
+// FIX 2 & 3: Route HMASTLOCK thẳng xuống Slave (Address Phase timing)
+assign HMASTLOCK_OUT = HMASTLOCK;
+
 assign HADDR =
         (HMASTER == 0) ? HADDR_M0 :
         (HMASTER == 1) ? HADDR_M1 :
@@ -205,12 +223,14 @@ assign HADDR =
         (HMASTER == 3) ? HADDR_M3 :
                          32'd0;
 
-assign HTRANS =
+assign htrans_int =
         (HMASTER == 0) ? HTRANS_M0 :
         (HMASTER == 1) ? HTRANS_M1 :
         (HMASTER == 2) ? HTRANS_M2 :
         (HMASTER == 3) ? HTRANS_M3 :
                          TR_IDLE;
+
+assign HTRANS = htrans_int;
 
 assign HWRITE =
         (HMASTER == 0) ? HWRITE_M0 :
@@ -241,7 +261,7 @@ assign HPROT =
                          4'b0011;
 
 //////////////////////////////////////////////////////////////
-// WRITE DATA MUX
+// WRITE DATA MUX (Data Phase timing)
 //////////////////////////////////////////////////////////////
 
 assign HWDATA =
@@ -252,7 +272,7 @@ assign HWDATA =
                               32'd0;
 
 //////////////////////////////////////////////////////////////
-// SLAVE -> MASTER RESPONSE MUX
+// SLAVE -> MASTER RESPONSE MUX (Data Phase timing)
 //////////////////////////////////////////////////////////////
 
 assign HRDATA =
@@ -273,18 +293,21 @@ assign hready_global =
 
 assign HREADY = hready_global;
 
-//
-// IMPORTANT FIX:
-// Idle/unselected bus must return OKAY,
-// not ERROR.
-//
-
+// FIX 5: Logic Default Slave chuẩn mực. 
+// Chỉ ném ERROR khi truy cập vô thừa nhận là NONSEQ hoặc SEQ.
 assign HRESP =
         (HSEL_S0_data)      ? HRESP_S0 :
         (HSEL_S1_data)      ? HRESP_S1 :
         (HSEL_S2_data)      ? HRESP_S2 :
         (HSEL_S3_data)      ? HRESP_S3 :
         (HSEL_DEFAULT_data) ? HRESP_DEF :
+        (HTRANS_data == TR_NONSEQ || HTRANS_data == TR_SEQ) ? RESP_ERROR : 
                               RESP_OKAY;
+
+//////////////////////////////////////////////////////////////
+// SLAVE -> ARBITER HSPLIT AGGREGATION
+//////////////////////////////////////////////////////////////
+
+assign HSPLIT = HSPLIT_S0 | HSPLIT_S1 | HSPLIT_S2 | HSPLIT_S3 | HSPLIT_DEF;
 
 endmodule
